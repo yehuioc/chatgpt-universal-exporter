@@ -1,0 +1,301 @@
+': deviceId
+        };
+        if (workspaceId) { headers['ChatGPT-Account-Id'] = workspaceId; }
+
+        const archiveStates = includeArchived ? [false, true] : [false];
+
+        for (const is_archived of archiveStates) {
+            let offset = 0, has_more = true, page = 0;
+            do {
+                btn.textContent = `📋 加载对话列表 (${is_archived ? 'Archived' : 'Active'} p${++page})`;
+                const j = await fetchJsonWithRetry(
+                    `/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`,
+                    { headers },
+                    '加载选择用对话列表'
+                );
+
+                if (j.items && j.items.length > 0) {
+                    j.items.forEach(it => {
+                        if (!it?.id) return;
+                        rememberConversationMeta(it, { source: is_archived ? '普通历史/Archived' : '普通历史/Active', is_archived });
+                        itemsById.set(it.id, {
+                            id: it.id,
+                            title: getConvTitle(it),
+                            update_time: getConvUpdatedTime(it),
+                            is_archived
+                        });
+                    });
+                    has_more = j.items.length === PAGE_LIMIT;
+                    offset += j.items.length;
+                } else {
+                    has_more = false;
+                }
+
+                await sleep(listJitter());
+            } while (has_more);
+        }
+
+        return Array.from(itemsById.values()).sort((a, b) => {
+            const ta = a.update_time ? new Date(a.update_time).getTime() : 0;
+            const tb = b.update_time ? new Date(b.update_time).getTime() : 0;
+            return tb - ta;
+        });
+    }
+
+    function showConversationSelectDialog(items, options = {}) {
+        const { mode = 'personal', workspaceId = null } = options;
+        return new Promise(resolve => {
+            const old = document.getElementById('select-export-dialog-overlay');
+            if (old) old.remove();
+
+            const overlay = document.createElement('div');
+            overlay.id = 'select-export-dialog-overlay';
+            Object.assign(overlay.style, {
+                position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
+                backgroundColor: 'rgba(0,0,0,.5)', zIndex: '100000',
+                display: 'flex', alignItems: 'center', justifyContent: 'center'
+            });
+
+            const dialog = document.createElement('div');
+            Object.assign(dialog.style, {
+                background: '#fff', color: '#111', width: '760px', maxWidth: '92vw',
+                height: '760px', maxHeight: '88vh', borderRadius: '12px',
+                boxShadow: '0 12px 40px rgba(0,0,0,.25)', padding: '18px',
+                boxSizing: 'border-box', fontFamily: 'Arial, sans-serif',
+                display: 'flex', flexDirection: 'column', gap: '12px'
+            });
+
+            const header = document.createElement('div');
+            header.innerHTML = `
+                <div style="font-size:18px;font-weight:700;margin-bottom:6px;">选择要导出的对话</div>
+                <div style="font-size:13px;color:#555;">共加载 ${items.length} 条历史记录。这里只加载标题列表，勾选后才会逐条下载完整详情。</div>
+            `;
+
+            const controls = document.createElement('div');
+            controls.style.display = 'flex';
+            controls.style.gap = '8px';
+            controls.style.flexWrap = 'wrap';
+            controls.innerHTML = `
+                <input id="select-export-search" placeholder="搜索标题或 ID..." style="flex:1;min-width:220px;padding:8px;border:1px solid #ccc;border-radius:8px;">
+                <button id="select-visible-btn" style="padding:8px 10px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">勾选当前筛选</button>
+                <button id="unselect-visible-btn" style="padding:8px 10px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">取消当前筛选</button>
+                <button id="select-recent-30-btn" style="padding:8px 10px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">最近30条</button>
+                <button id="select-recent-100-btn" style="padding:8px 10px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">最近100条</button>
+            `;
+
+            const status = document.createElement('div');
+            status.style.cssText = 'font-size:13px;color:#444;';
+
+            const list = document.createElement('div');
+            list.style.cssText = 'flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;background:#fafafa;padding:6px;';
+
+            const footer = document.createElement('div');
+            footer.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:12px;';
+            footer.innerHTML = `
+                <div style="font-size:12px;color:#666;">建议先导最近30/100条，确认没问题再扩大范围。</div>
+                <div style="display:flex;gap:8px;">
+                    <button id="cancel-select-export-btn" style="padding:10px 14px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">取消</button>
+                    <button id="start-select-export-btn" style="padding:10px 14px;border:none;border-radius:8px;background:#10a37f;color:#fff;font-weight:700;cursor:pointer;">导出已勾选</button>
+                </div>
+            `;
+
+            dialog.appendChild(header);
+            dialog.appendChild(controls);
+            dialog.appendChild(status);
+            dialog.appendChild(list);
+            dialog.appendChild(footer);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+
+            const checked = new Set();
+            let visibleItems = items.slice();
+
+            function escapeHtml(s) {
+                return String(s ?? '')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+            }
+
+            function fmtTime(t) {
+                if (!t) return '';
+                try { return new Date(t).toLocaleString(); } catch (_) { return String(t); }
+            }
+
+            function updateStatus() {
+                status.textContent = `当前显示 ${visibleItems.length} 条；已勾选 ${checked.size} 条。`;
+            }
+
+            function render() {
+                const q = document.getElementById('select-export-search').value.trim().toLowerCase();
+                visibleItems = q
+                    ? items.filter(it => (it.title || '').toLowerCase().includes(q) || it.id.toLowerCase().includes(q))
+                    : items.slice();
+
+                const html = visibleItems.map(it => {
+                    const safeTitle = escapeHtml(it.title || 'Untitled Conversation');
+                    const safeId = escapeHtml(it.id);
+                    const time = escapeHtml(fmtTime(it.update_time));
+                    return `
+                        <label style="display:flex;gap:10px;align-items:flex-start;padding:8px;border-bottom:1px solid #eee;cursor:pointer;background:#fff;">
+                            <input type="checkbox" class="select-export-checkbox" data-id="${safeId}" ${checked.has(it.id) ? 'checked' : ''} style="margin-top:4px;">
+                            <div style="min-width:0;">
+                                <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safeTitle}</div>
+                                <div style="font-size:12px;color:#777;">${time} ${it.is_archived ? ' · Archived' : ''}</div>
+                                <div style="font-size:11px;color:#999;font-family:monospace;">${safeId}</div>
+                            </div>
+                        </label>
+                    `;
+                }).join('');
+
+                list.innerHTML = html || '<div style="padding:18px;color:#777;">没有匹配结果</div>';
+
+                list.querySelectorAll('.select-export-checkbox').forEach(cb => {
+                    cb.onchange = () => {
+                        if (cb.checked) checked.add(cb.dataset.id);
+                        else checked.delete(cb.dataset.id);
+                        updateStatus();
+                    };
+                });
+
+                updateStatus();
+            }
+
+            document.getElementById('select-export-search').oninput = render;
+
+            document.getElementById('select-visible-btn').onclick = () => {
+                visibleItems.forEach(it => checked.add(it.id));
+                render();
+            };
+            document.getElementById('unselect-visible-btn').onclick = () => {
+                visibleItems.forEach(it => checked.delete(it.id));
+                render();
+            };
+            document.getElementById('select-recent-30-btn').onclick = () => {
+                checked.clear();
+                items.slice(0, 30).forEach(it => checked.add(it.id));
+                render();
+            };
+            document.getElementById('select-recent-100-btn').onclick = () => {
+                checked.clear();
+                items.slice(0, 100).forEach(it => checked.add(it.id));
+                render();
+            };
+            document.getElementById('cancel-select-export-btn').onclick = () => {
+                overlay.remove();
+                resolve(null);
+            };
+            document.getElementById('start-select-export-btn').onclick = () => {
+                const selected = items.filter(it => checked.has(it.id));
+                if (selected.length === 0) {
+                    alert('还没有勾选任何对话。');
+                    return;
+                }
+                overlay.remove();
+                resolve(selected);
+            };
+
+            overlay.onclick = e => {
+                if (e.target === overlay) {
+                    overlay.remove();
+                    resolve(null);
+                }
+            };
+
+            render();
+        });
+    }
+
+    async function startSelectiveExportProcess(mode, workspaceId) {
+        const btn = getExportButton();
+        btn.disabled = true;
+
+        if (!await ensureAccessToken()) {
+            btn.disabled = false;
+            btn.textContent = 'Export Conversations';
+            return;
+        }
+
+        try {
+            btn.textContent = '📋 加载可选对话列表…';
+            const items = await collectConversationItems(btn, workspaceId, true);
+            const selected = await showConversationSelectDialog(items, { mode, workspaceId });
+
+            if (!selected || selected.length === 0) {
+                btn.disabled = false;
+                btn.textContent = 'Export Conversations';
+                return;
+            }
+
+            const zip = new JSZip();
+            const failures = [];
+            const succeeded = [];
+
+            for (let i = 0; i < selected.length; i++) {
+                const item = selected[i];
+                btn.textContent = `📥 选择导出 (${i + 1}/${selected.length})`;
+
+                try {
+                    const convData = await getConversation(item.id, workspaceId);
+                    zip.file(generateUniqueFilename(convData), JSON.stringify(convData, null, 2));
+                    zip.file(generateMarkdownFilename(convData), convertConversationToMarkdown(convData));
+                    succeeded.push({
+                        id: item.id,
+                        title: convData.title || item.title || 'Untitled Conversation',
+                        url: buildConversationUrl(item.id),
+                        exported_at: new Date().toISOString()
+                    });
+                } catch (e) {
+                    console.error(`❌ 选择导出失败: ${item.id}`, e);
+                    const meta = getConversationMeta(item.id);
+                    failures.push({
+                        id: item.id,
+                        title: item.title || meta.title || 'Unknown title',
+                        label: `选择导出 ${i + 1}/${selected.length}`,
+                        source: meta.source || '选择导出',
+                        project_title: meta.project_title,
+                        update_time: item.update_time || meta.update_time,
+                        url: buildConversationUrl(item.id),
+                        error: e?.message || String(e),
+                        failed_at: new Date().toISOString()
+                    });
+                }
+
+                await sleep(detailJitter());
+            }
+
+            zip.file('_selected_export_manifest.json', JSON.stringify({
+                exported_at: new Date().toISOString(),
+                mode,
+                workspaceId,
+                selected_count: selected.length,
+                success_count: succeeded.length,
+                failure_count: failures.length,
+                selected,
+                succeeded
+            }, null, 2));
+
+            if (failures.length > 0) {
+                zip.file('_export_failures.json', JSON.stringify(failures, null, 2));
+                zip.file('_export_failures.md', renderFailuresMarkdown(failures));
+            }
+
+            btn.textContent = '📦 生成选择导出 ZIP…';
+            const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+            const date = new Date().toISOString().slice(0, 10);
+            const filename = mode === 'team'
+                ? `chatgpt_selected_team_backup_${workspaceId}_${date}.zip`
+                : `chatgpt_selected_personal_backup_${date}.zip`;
+            downloadFile(blob, filename);
+
+            alert(failures.length > 0
+                ? `⚠️ 选择导出完成：成功 ${succeeded.length} 条，失败 ${failures.length} 条。失败项已写入 _export_failures.md。`
+                : `✅ 选择导出完成：成功 ${succeeded.length} 条。`
+            );
+            btn.textContent = failures.length > 0 ? `⚠️ 完成，失败 ${failures.length}` : '✅ 完成';
+
+        } catch (e) {
+            console.error("选择导出过程中发生严重错误:", e);
+            alert(`选择导出失败: ${e.message}。详情请查看控制台（F12 -> Console）。`);
+            btn.textContent = '⚠️ Error';
