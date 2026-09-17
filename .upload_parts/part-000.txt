@@ -1,0 +1,172 @@
+// ==UserScript==
+// @name         ChatGPT Universal Exporter (Markdown Support, Selective + Retry Failed)
+// @version      1.0.9-selective-retry-failed
+// @description  User-centric ZIP exporter with multi-ID support. Supports JSON & Markdown formats. Based on ChatGPT Universal Exporter.
+// @author       huhu
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @grant        none
+// @license      MIT
+// @source       https://greasyfork.org/scripts/538495-chatgpt-universal-exporter
+// @namespace    https://github.com/huhusmang/ChatGPT-Exporter
+// @downloadURL https://update.greasyfork.org/scripts/556233/ChatGPT%20Universal%20Exporter%20%28Markdown%20Support%29.user.js
+// @updateURL https://update.greasyfork.org/scripts/556233/ChatGPT%20Universal%20Exporter%20%28Markdown%20Support%29.meta.js
+// ==/UserScript==
+
+/* ============================================================
+    v1.0.0 变更 (基于原始脚本的Markdown支持增强版)
+    ------------------------------------------------------------
+    • 增加了 Markdown 格式导出支持
+    • 保持了原有的 JSON 导出功能
+    ========================================================== */
+
+(function () {
+    'use strict';
+
+    // --- 配置与全局变量 ---
+    // --- 限速配置 ---
+    // Fast Retry：正常抓取接近原脚本速度，只保留短随机间隔。
+    // 只有遇到 429 / Too many requests / 5xx 临时错误时，才进入长等待并重试。
+    const LIST_DELAY_MIN = 500;
+    const LIST_DELAY_MAX = 1200;
+    const DETAIL_DELAY_MIN = 800;
+    const DETAIL_DELAY_MAX = 1800;
+    const RATE_LIMIT_FALLBACK_MS = 150000; // 429 且服务端没给 Retry-After 时，默认等 2 分钟
+    const MAX_RETRIES = 7;
+    const PAGE_LIMIT = 100; // 从 100 降到 50，减轻列表接口压力
+    const LONG_COOLDOWN_EVERY = 0; // 每抓 N 个详情，主动长休息一次
+    const LONG_COOLDOWN_MS = 0;
+
+    let accessToken = null;
+    let capturedWorkspaceIds = new Set(); // 使用Set存储网络拦截到的ID，确保唯一性
+    const conversationMetaById = new Map(); // 记录 id -> 标题/更新时间/来源，用于失败清单
+
+    // --- 核心：网络拦截与信息捕获 ---
+    (function interceptNetwork() {
+        const rawFetch = window.fetch;
+        window.fetch = async function (resource, options) {
+            tryCaptureToken(options?.headers);
+            if (options?.headers?.['ChatGPT-Account-Id']) {
+                const id = options.headers['ChatGPT-Account-Id'];
+                if (id && !capturedWorkspaceIds.has(id)) {
+                    console.log('🎯 [Fetch] 捕获到 Workspace ID:', id);
+                    capturedWorkspaceIds.add(id);
+                }
+            }
+            return rawFetch.apply(this, arguments);
+        };
+
+        const rawOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function () {
+            this.addEventListener('readystatechange', () => {
+                if (this.readyState === 4) {
+                    try {
+                        tryCaptureToken(this.getRequestHeader('Authorization'));
+                        const id = this.getRequestHeader('ChatGPT-Account-Id');
+                        if (id && !capturedWorkspaceIds.has(id)) {
+                            console.log('🎯 [XHR] 捕获到 Workspace ID:', id);
+                            capturedWorkspaceIds.add(id);
+                        }
+                    } catch (_) {}
+                }
+            });
+            return rawOpen.apply(this, arguments);
+        };
+    })();
+
+    function tryCaptureToken(header) {
+        if (!header) return;
+        const h = typeof header === 'string' ? header : header instanceof Headers ? header.get('Authorization') : header.Authorization || header.authorization;
+        if (h?.startsWith('Bearer ')) {
+        const token = h.slice(7);
+        // [v8.2.0 修复] 在捕获源头增加验证，拒绝已知的无效占位符Token
+        if (token && token.toLowerCase() !== 'dummy') {
+            accessToken = token;
+        }
+        }
+    }
+
+    async function ensureAccessToken() {
+        if (accessToken) return accessToken;
+        try {
+            const session = await (await fetch('/api/auth/session?unstable_client=true')).json();
+            if (session.accessToken) {
+                accessToken = session.accessToken;
+                return accessToken;
+            }
+        } catch (_) {}
+        alert('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
+        return null;
+    }
+
+    // --- 辅助函数 ---
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const randomBetween = (min, max) => min + Math.random() * (max - min);
+    const listJitter = () => randomBetween(LIST_DELAY_MIN, LIST_DELAY_MAX);
+    const detailJitter = () => randomBetween(DETAIL_DELAY_MIN, DETAIL_DELAY_MAX);
+    const sanitizeFilename = (name) => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
+
+    function rememberConversationMeta(item, extra = {}) {
+        if (!item?.id) return;
+        const old = conversationMetaById.get(item.id) || {};
+        conversationMetaById.set(item.id, {
+            id: item.id,
+            title: item.title || old.title || 'Untitled Conversation',
+            update_time: item.update_time || item.updated_at || item.create_time || item.created_at || old.update_time || null,
+            is_archived: typeof extra.is_archived === 'boolean' ? extra.is_archived : old.is_archived,
+            source: extra.source || old.source || '历史列表',
+            project_title: extra.project_title || old.project_title || null
+        });
+    }
+
+    function getConversationMeta(id) {
+        return conversationMetaById.get(id) || {
+            id,
+            title: 'Unknown title',
+            update_time: null,
+            source: '未知来源',
+            project_title: null
+        };
+    }
+
+    function buildConversationUrl(id) {
+        try {
+            return `${location.origin}/c/${id}`;
+        } catch (_) {
+            return `https://chatgpt.com/c/${id}`;
+        }
+    }
+
+    function renderFailuresMarkdown(failures) {
+        const lines = ['# Export Failures', ''];
+        lines.push(`Total failures: ${failures.length}`);
+        lines.push('');
+        failures.forEach((f, index) => {
+            lines.push(`## ${index + 1}. ${f.title || 'Unknown title'}`);
+            lines.push('');
+            lines.push(`- ID: \`${f.id}\``);
+            lines.push(`- Label: ${f.label || ''}`);
+            lines.push(`- Source: ${f.source || 'unknown'}`);
+            if (f.project_title) lines.push(`- Project: ${f.project_title}`);
+            if (f.update_time) lines.push(`- Updated: ${f.update_time}`);
+            lines.push(`- Error: ${f.error}`);
+            lines.push(`- Failed at: ${f.failed_at}`);
+            lines.push(`- Open: ${f.url}`);
+            lines.push('');
+        });
+        return lines.join('\n');
+    }
+
+
+    function parseRetryAfterMs(headers) {
+        const value = headers?.get?.('Retry-After');
+        if (!value) return null;
+        const seconds = Number(value);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const dateMs = Date.parse(value);
+        if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+        return null;
+    }
+
+   
