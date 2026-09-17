@@ -169,7 +169,7 @@
         return null;
     }
 
-     async function fetchJsonWithRetry(url, options = {}, label = 'request') {
+    async function fetchJsonWithRetry(url, options = {}, label = 'request') {
         let lastError = null;
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
