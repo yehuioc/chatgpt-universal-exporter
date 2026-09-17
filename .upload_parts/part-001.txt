@@ -1,0 +1,190 @@
+  async function fetchJsonWithRetry(url, options = {}, label = 'request') {
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                const r = await fetch(url, options);
+
+                if (r.ok) {
+                    return await r.json();
+                }
+
+                const retryable = r.status === 429 || [500, 502, 503, 504].includes(r.status);
+                if (!retryable) {
+                    const body = await r.text().catch(() => '');
+                    throw new Error(`${label} 失败 (${r.status}) ${body.slice(0, 300)}`);
+                }
+
+                const retryAfterMs = parseRetryAfterMs(r.headers);
+                const backoffMs = retryAfterMs ?? (
+                    r.status === 429
+                        ? RATE_LIMIT_FALLBACK_MS + randomBetween(0, 60000)
+                        : Math.min(300000, 15000 * Math.pow(2, attempt - 1) + randomBetween(0, 15000))
+                );
+
+                console.warn(`⏳ ${label} 触发限速/临时错误 HTTP ${r.status}${r.status === 429 ? ' / Too many requests' : ''}，第 ${attempt}/${MAX_RETRIES} 次，等待 ${Math.round(backoffMs / 1000)} 秒后重试:`, url);
+                await sleep(backoffMs);
+                lastError = new Error(`${label} HTTP ${r.status}`);
+            } catch (e) {
+                lastError = e;
+
+                if (attempt >= MAX_RETRIES) break;
+
+                const backoffMs = Math.min(300000, 15000 * Math.pow(2, attempt - 1) + randomBetween(0, 15000));
+                console.warn(`⏳ ${label} 请求异常，第 ${attempt}/${MAX_RETRIES} 次，等待 ${Math.round(backoffMs / 1000)} 秒后重试:`, e);
+                await sleep(backoffMs);
+            }
+        }
+
+        throw lastError || new Error(`${label} 多次重试后失败`);
+    }
+
+    /**
+     * [新增] 从Cookie中获取 oai-device-id
+     * @returns {string|null} - 返回设备ID或null
+     */
+    function getOaiDeviceId() {
+        const cookieString = document.cookie;
+        const match = cookieString.match(/oai-did=([^;]+)/);
+        return match ? match[1] : null;
+    }
+
+    function generateUniqueFilename(convData) {
+        const convId = convData.conversation_id || '';
+        const shortId = convId.includes('-') ? convId.split('-').pop() : (convId || Date.now().toString(36));
+        let baseName = convData.title;
+        if (!baseName || baseName.trim().toLowerCase() === 'new chat') {
+            baseName = 'Untitled Conversation';
+        }
+        return `${sanitizeFilename(baseName)}_${shortId}.json`;
+    }
+
+    function generateMarkdownFilename(convData) {
+        const jsonName = generateUniqueFilename(convData);
+        return jsonName.endsWith('.json')
+            ? `${jsonName.slice(0, -5)}.md`
+            : `${jsonName}.md`;
+    }
+
+    function cleanMessageContent(text) {
+        if (!text) return '';
+        return text
+            .replace(/\uE200cite(?:\uE202turn\d+(?:search|view)\d+)+\uE201/gi, '')
+            .replace(/cite(?:turn\d+(?:search|view)\d+)+/gi, '')
+            .trim();
+    }
+
+    function extractConversationMessages(convData) {
+        const mapping = convData?.mapping;
+        if (!mapping) return [];
+
+        const messages = [];
+        const mappingKeys = Object.keys(mapping);
+        const rootId = mapping['client-created-root']
+            ? 'client-created-root'
+            : mappingKeys.find(id => !mapping[id]?.parent) || mappingKeys[0];
+        const visited = new Set();
+
+        const traverse = (nodeId) => {
+            if (!nodeId || visited.has(nodeId)) return;
+            visited.add(nodeId);
+            const node = mapping[nodeId];
+            if (!node) return;
+
+            const msg = node.message;
+            if (msg) {
+                const author = msg.author?.role;
+                const isHidden = msg.metadata?.is_visually_hidden_from_conversation ||
+                    msg.metadata?.is_contextual_answers_system_message;
+                if (author && author !== 'system' && !isHidden) {
+                    const content = msg.content;
+                    if (content?.content_type === 'text' && Array.isArray(content.parts)) {
+                        const rawText = content.parts
+                            .map(part => typeof part === 'string' ? part : (part?.text ?? ''))
+                            .filter(Boolean)
+                            .join('\n');
+                        const cleaned = cleanMessageContent(rawText);
+                        if (cleaned) {
+                            messages.push({
+                                role: author,
+                                content: cleaned,
+                                create_time: msg.create_time || null
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (Array.isArray(node.children)) {
+                node.children.forEach(childId => traverse(childId));
+            }
+        };
+
+        if (rootId) {
+            traverse(rootId);
+        } else {
+            mappingKeys.forEach(traverse);
+        }
+
+        return messages;
+    }
+
+    function convertConversationToMarkdown(convData) {
+        const messages = extractConversationMessages(convData);
+        if (messages.length === 0) {
+            return '# Conversation\nNo visible user or assistant messages were exported.\n';
+        }
+
+        const mdLines = [];
+        messages.forEach(msg => {
+            const roleLabel = msg.role === 'user' ? '# User' : '# Assistant';
+            mdLines.push(roleLabel);
+            mdLines.push(msg.content);
+            mdLines.push('');
+        });
+
+        return mdLines.join('\n').trim() + '\n';
+    }
+
+    function downloadFile(blob, filename) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+    }
+
+    // --- 导出流程核心逻辑 ---
+    function getExportButton() {
+        let btn = document.getElementById('gpt-rescue-btn');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'gpt-rescue-btn';
+            btn.style.display = 'none';
+            btn.textContent = 'Export Conversations';
+            document.body.appendChild(btn);
+        }
+        return btn;
+    }
+
+    async function startExportProcess(mode, workspaceId) {
+        const btn = getExportButton();
+        btn.disabled = true;
+
+        if (!await ensureAccessToken()) {
+            btn.disabled = false;
+            btn.textContent = 'Export Conversations';
+            return;
+        }
+
+        try {
+            const zip = new JSZip();
+            const conversationCache = new Map(); // 同一条对话在普通列表和项目列表重复出现时，不再重复请求详情
+            const failures = [];
+            let detailFetchCount = 0;
+
+            async function exportConversationToFolder(convId, folder, label) {
+                try {
+                    let convData = conversationCache.get(c
